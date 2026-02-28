@@ -8,4 +8,10 @@
     <RootNamespace>DigitalUID</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Reference Include="SecuGen.FDxSDKPro.DotNet.Windows">
+      <HintPath>Assemblies\SecuGen.FDxSDKPro.DotNet.Windows.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
 </Project>

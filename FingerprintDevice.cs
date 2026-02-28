@@ -1,15 +1,18 @@
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
+using SecuGen.FDxSDKPro.Windows;
 
 namespace DigitalUID;
 
 /// <summary>
-/// High-level managed wrapper around the SecuGen SGFPLIB native library.
+/// High-level managed wrapper around the SecuGen SDK (SGFingerPrintManager).
 /// Implements <see cref="IDisposable"/> – use inside a <c>using</c> block or
-/// call <see cref="Dispose"/> to release the device and native handle.
+/// call <see cref="Dispose"/> to release the device.
 /// </summary>
 internal sealed class FingerprintDevice : IDisposable
 {
-    private IntPtr _handle = IntPtr.Zero;
+    private SGFingerPrintManager? _sgfpm;
     private bool _deviceOpen;
     private bool _disposed;
 
@@ -49,66 +52,57 @@ internal sealed class FingerprintDevice : IDisposable
 
     private void Initialize(SgDeviceType deviceType, uint deviceIndex)
     {
-        // ── 1. Check that the native library can be loaded ────────────────
-        CheckNativeLibraryAvailable();
+        // ── 1. Create the managed SDK instance (loads sgfplib.dll) ────────
+        try
+        {
+            _sgfpm = new SGFingerPrintManager();
+        }
+        catch (FileNotFoundException)
+        {
+            ThrowNativeLibraryNotFound();
+        }
 
-        // ── 2. Create the SDK handle ──────────────────────────────────────
-        var err = (SgError)NativeMethods.Create(out _handle);
-        ThrowIfError(err, "SGFPM_Create");
-
-        // ── 3. Initialise for the requested device type ───────────────────
-        err = (SgError)NativeMethods.Init(_handle, (uint)deviceType);
-        if (err == SgError.DeviceNotFound)
+        // ── 2. Initialise for the requested device type ───────────────────
+        var err = (SGFPMError)_sgfpm!.Init(MapDeviceType(deviceType));
+        if (err == SGFPMError.ERROR_DEVICE_NOT_FOUND)
             ThrowDeviceNotFound(deviceType);
-        ThrowIfError(err, "SGFPM_Init");
+        ThrowIfError(err, "Init");
 
-        // ── 4. Open the physical USB device ──────────────────────────────
-        err = (SgError)NativeMethods.OpenDevice(_handle, deviceIndex);
-        if (err == SgError.DeviceNotFound)
+        // ── 3. Open the physical USB device ──────────────────────────────
+        err = (SGFPMError)_sgfpm.OpenDevice((int)deviceIndex);
+        if (err == SGFPMError.ERROR_DEVICE_NOT_FOUND)
             ThrowDeviceNotFound(deviceType);
-        ThrowIfError(err, "SGFPM_OpenDevice");
+        ThrowIfError(err, "OpenDevice");
 
         _deviceOpen = true;
     }
 
-    /// <summary>
-    /// Probes for the shared library <em>before</em> any P/Invoke call so
-    /// we can emit an actionable error message instead of a DllNotFoundException
-    /// with no context.
-    /// </summary>
-    private static void CheckNativeLibraryAvailable()
+    private static void ThrowNativeLibraryNotFound()
     {
         bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         string libName = isWindows ? "sgfplib.dll" : "libsgfplib.so";
+        string installInstructions = isWindows
+            ? """
+              Install the SecuGen Fingerprint SDK for Windows:
+                1. Download from https://secugen.com/products/sdk/
+                2. Run the installer – it copies sgfplib.dll to the System32 folder.
+                3. Make sure the USB driver is installed (included in the SDK package).
+              """
+            : """
+              Install the SecuGen Fingerprint SDK for Linux:
+                1. Download the Linux SDK from https://secugen.com/products/sdk/
+                2. Copy libsgfplib.so to /usr/lib or /usr/local/lib
+                3. Run: sudo ldconfig
+                4. Plug in your reader and verify with: lsusb | grep -i secugen
+              """;
 
-        // Try to load via NativeLibrary – gives us a clean true/false result.
-        if (!NativeLibrary.TryLoad(libName, out IntPtr lib))
-        {
-            string installInstructions = isWindows
-                ? """
-                  Install the SecuGen Fingerprint SDK for Windows:
-                    1. Download from https://secugen.com/products/sdk/
-                    2. Run the installer – it copies sgfplib.dll to the System32 folder.
-                    3. Make sure the USB driver is installed (included in the SDK package).
-                  """
-                : """
-                  Install the SecuGen Fingerprint SDK for Linux:
-                    1. Download the Linux SDK from https://secugen.com/products/sdk/
-                    2. Copy libsgfplib.so to /usr/lib or /usr/local/lib
-                    3. Run: sudo ldconfig
-                    4. Plug in your reader and verify with: lsusb | grep -i secugen
-                  """;
+        throw new SecuGenException(
+            $"""
+            SecuGen SDK native library '{libName}' could not be loaded.
 
-            throw new SecuGenException(
-                $"""
-                SecuGen SDK native library '{libName}' could not be loaded.
-
-                {installInstructions}
-                Supported devices: Hamster Pro 10/20/20 AP, Hamster IV/III/Plus/Duo, DEX.
-                """);
-        }
-
-        NativeLibrary.Free(lib);
+            {installInstructions}
+            Supported devices: Hamster Pro 10/20/20 AP, Hamster IV/III/Plus/Duo, DEX.
+            """);
     }
 
     private static void ThrowDeviceNotFound(SgDeviceType requested)
@@ -147,15 +141,15 @@ internal sealed class FingerprintDevice : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        if (_handle != IntPtr.Zero)
+        if (_sgfpm != null)
         {
             if (_deviceOpen)
             {
-                NativeMethods.CloseDevice(_handle);
+                _sgfpm.CloseDevice();
                 _deviceOpen = false;
             }
-            NativeMethods.Terminate(_handle);
-            _handle = IntPtr.Zero;
+            _sgfpm.Dispose();
+            _sgfpm = null;
         }
     }
 
@@ -165,18 +159,43 @@ internal sealed class FingerprintDevice : IDisposable
     public SgDeviceInfo GetDeviceInfo()
     {
         EnsureOpen();
-        var info = new SgDeviceInfo();
-        ThrowIfError((SgError)NativeMethods.GetDeviceInfo(_handle, ref info), "SGFPM_GetDeviceInfo");
-        return info;
+        var p = new SGFPMDeviceInfoParam();
+        ThrowIfError(_sgfpm!.GetDeviceInfo(p), "GetDeviceInfo");
+
+        uint devType = 0;
+        if (_sgfpm.EnumerateDevice() == (int)SGFPMError.ERROR_NONE && _sgfpm.NumberOfDevice > 0)
+        {
+            var dl = new SGFPMDeviceList();
+            if (_sgfpm.GetEnumDeviceInfo(0, dl) == (int)SGFPMError.ERROR_NONE)
+                devType = MapDeviceNameToType(dl.DevName);
+        }
+
+        return new SgDeviceInfo
+        {
+            DevId        = p.DeviceID.ToString(),
+            ComPort      = (uint)p.ComPort,
+            DevType      = devType,
+            FWVersion    = (uint)p.FWVersion,
+            SerialNumber = Encoding.ASCII.GetString(p.DeviceSN).TrimEnd('\0'),
+        };
     }
 
     /// <summary>Returns sensor image size, brightness, contrast, gain and DPI.</summary>
     public SgFingerInfo GetImageInfo()
     {
         EnsureOpen();
-        var info = new SgFingerInfo();
-        ThrowIfError((SgError)NativeMethods.GetImageInfo(_handle, ref info), "SGFPM_GetImageInfo");
-        return info;
+        var p = new SGFPMDeviceInfoParam();
+        ThrowIfError(_sgfpm!.GetDeviceInfo(p), "GetDeviceInfo");
+
+        return new SgFingerInfo
+        {
+            ImageWidth  = (uint)p.ImageWidth,
+            ImageHeight = (uint)p.ImageHeight,
+            Brightness  = (uint)p.Brightness,
+            Contrast    = (uint)p.Contrast,
+            Gain        = (uint)p.Gain,
+            Resolution  = (uint)p.ImageDPI,
+        };
     }
 
     // ── Sensor tuning ─────────────────────────────────────────────────────
@@ -188,14 +207,16 @@ internal sealed class FingerprintDevice : IDisposable
     public void SetBrightness(uint brightness)
     {
         EnsureOpen();
-        ThrowIfError((SgError)NativeMethods.SetBrightness(_handle, brightness), "SGFPM_SetBrightness");
+        ThrowIfError(_sgfpm!.SetBrightness((int)brightness), "SetBrightness");
     }
 
-    /// <summary>Adjusts the analogue gain (0–255, default = 128).</summary>
+    /// <summary>Adjusts the analogue gain (0–255, default = 128).
+    /// <para><b>Note:</b> The managed SDK (<c>SGFingerPrintManager</c>) does not expose
+    /// a gain-control method; calling this has no effect.</para></summary>
     public void SetGain(uint gain)
     {
         EnsureOpen();
-        ThrowIfError((SgError)NativeMethods.SetGain(_handle, gain), "SGFPM_SetGain");
+        // SGFingerPrintManager does not expose a SetGain method.
     }
 
     // ── Capture ───────────────────────────────────────────────────────────
@@ -209,7 +230,7 @@ internal sealed class FingerprintDevice : IDisposable
         EnsureOpen();
         var info = GetImageInfo();
         var buffer = new byte[info.ImageWidth * info.ImageHeight];
-        ThrowIfError((SgError)NativeMethods.GetImage(_handle, buffer), "SGFPM_GetImage");
+        ThrowIfError(_sgfpm!.GetImage(buffer), "GetImage");
         return buffer;
     }
 
@@ -224,10 +245,10 @@ internal sealed class FingerprintDevice : IDisposable
     {
         EnsureOpen();
         var info = GetImageInfo();
+        int q = 0;
         ThrowIfError(
-            (SgError)NativeMethods.GetImageQuality(
-                _handle, info.ImageWidth, info.ImageHeight, imageBuffer, out uint q),
-            "SGFPM_GetImageQuality");
+            _sgfpm!.GetImageQuality((int)info.ImageWidth, (int)info.ImageHeight, imageBuffer, ref q),
+            "GetImageQuality");
 
         var quality = (SgQuality)q;
         string desc = quality switch
@@ -248,8 +269,9 @@ internal sealed class FingerprintDevice : IDisposable
     public uint GetTemplateSize()
     {
         EnsureOpen();
-        ThrowIfError((SgError)NativeMethods.GetTemplateSize(_handle, out uint size), "SGFPM_GetTemplateSize");
-        return size;
+        int size = 0;
+        ThrowIfError(_sgfpm!.GetMaxTemplateSize(ref size), "GetMaxTemplateSize");
+        return (uint)size;
     }
 
     /// <summary>
@@ -259,33 +281,30 @@ internal sealed class FingerprintDevice : IDisposable
     public byte[] CreateTemplate(byte[] imageBuffer)
     {
         EnsureOpen();
-        var info = GetImageInfo();
         uint size = GetTemplateSize();
         var template = new byte[size];
-        ThrowIfError(
-            (SgError)NativeMethods.CreateTemplate(_handle, ref info, imageBuffer, template),
-            "SGFPM_CreateTemplate");
+        ThrowIfError(_sgfpm!.CreateTemplate(imageBuffer, template), "CreateTemplate");
         return template;
     }
 
     // ── Matching ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Compares two templates using the supplied security threshold.
+    /// Compares two templates using the supplied security level.
     /// Returns <c>true</c> when the two fingerprints are considered a match.
     /// </summary>
     /// <param name="threshold">
     /// A value from <see cref="SgThreshold"/>.
-    /// <see cref="SgThreshold.Normal"/> (FAR 1/1,000,000) is recommended.
+    /// <see cref="SgThreshold.Normal"/> (FAR ~1/1,000,000) is recommended.
     /// </param>
     public bool MatchTemplates(byte[] template1, byte[] template2,
         uint threshold = SgThreshold.Normal)
     {
         EnsureOpen();
+        bool matched = false;
         ThrowIfError(
-            (SgError)NativeMethods.MatchTemplate(
-                _handle, template1, template2, threshold, out bool matched),
-            "SGFPM_MatchTemplate");
+            _sgfpm!.MatchTemplate(template1, template2, (SGFPMSecurityLevel)threshold, ref matched),
+            "MatchTemplate");
         return matched;
     }
 
@@ -293,15 +312,19 @@ internal sealed class FingerprintDevice : IDisposable
 
     /// <summary>
     /// Reads the liveness / fake-finger indicator.
-    /// Returns <c>null</c> when the device does not support this feature.
+    /// Returns <c>null</c> when the device does not support this feature or
+    /// when the SDK reports <c>ERROR_FUNCTION_FAILED</c> / <c>ERROR_UNSUPPORTED_DEV</c>.
     /// </summary>
     public uint? GetFakeDetectInfo()
     {
         EnsureOpen();
-        var err = (SgError)NativeMethods.GetFakeDetectInfo(_handle, out uint value);
-        if (err == SgError.FunctionFailed) return null; // not supported on this model
-        ThrowIfError(err, "SGFPM_GetFakeDetectInfo");
-        return value;
+        int level = 0;
+        var err = (SGFPMError)_sgfpm!.GetFakeDetectionLevel(ref level);
+        if (err == SGFPMError.ERROR_FUNCTION_FAILED ||
+            err == SGFPMError.ERROR_UNSUPPORTED_DEV)
+            return null;
+        ThrowIfError(err, "GetFakeDetectionLevel");
+        return (uint)level;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -313,34 +336,64 @@ internal sealed class FingerprintDevice : IDisposable
             throw new InvalidOperationException("Device is not open.");
     }
 
-    private static void ThrowIfError(SgError error, string functionName)
+    private static void ThrowIfError(int errorCode, string functionName)
+        => ThrowIfError((SGFPMError)errorCode, functionName);
+
+    private static void ThrowIfError(SGFPMError error, string functionName)
     {
-        if (error == SgError.None) return;
+        if (error == SGFPMError.ERROR_NONE) return;
 
         string detail = error switch
         {
-            SgError.CreationFailed     => "SDK object creation failed (check SDK installation).",
-            SgError.FunctionFailed     => "The SDK function failed (check device connection).",
-            SgError.InvalidParam       => "An invalid parameter was passed to the SDK.",
-            SgError.NotInitialized     => "Device has not been initialised. Call Init first.",
-            SgError.AlreadyInitialized => "Device is already initialised.",
-            SgError.DeviceNotFound     => "No SecuGen device was found on any USB port.",
-            SgError.DeviceBusy         => "Device is currently busy – retry after a short delay.",
-            SgError.Timeout            => "The capture operation timed out. Try again.",
-            SgError.InvalidDevice      => "The device type specified is not valid.",
-            SgError.ChangeSettings     => "Could not apply the requested device settings.",
-            SgError.WrongImage         => "The image buffer contains invalid data.",
-            SgError.LackOfBandwidth    => "USB bandwidth insufficient – disconnect other USB devices.",
-            SgError.MemoryFailed       => "SDK memory allocation failed.",
-            SgError.SysFileFailed      => "A required SDK system file is missing.",
-            SgError.TamperAlert        => "Tamper alert triggered on the device.",
-            SgError.IniFileFailed      => "The SDK INI configuration file is missing or corrupt.",
-            SgError.TemplateZero       => "Template extraction returned a zero-length template.",
-            _                          => $"Unknown SDK error code {(uint)error}.",
+            SGFPMError.ERROR_CREATION_FAILED   => "SDK object creation failed (check SDK installation).",
+            SGFPMError.ERROR_FUNCTION_FAILED   => "The SDK function failed (check device connection).",
+            SGFPMError.ERROR_INVALID_PARAM     => "An invalid parameter was passed to the SDK.",
+            SGFPMError.ERROR_DLLLOAD_FAILED    => "The SDK DLL (sgfplib.dll) could not be loaded.",
+            SGFPMError.ERROR_DLLLOAD_FAILED_DRV  => "The SDK driver DLL could not be loaded.",
+            SGFPMError.ERROR_DLLLOAD_FAILED_ALGO => "The SDK algorithm DLL could not be loaded.",
+            SGFPMError.ERROR_DEVICE_NOT_FOUND  => "No SecuGen device was found on any USB port.",
+            SGFPMError.ERROR_TIME_OUT          => "The capture operation timed out. Try again.",
+            SGFPMError.ERROR_WRONG_IMAGE       => "The image buffer contains invalid data.",
+            SGFPMError.ERROR_LACK_OF_BANDWIDTH => "USB bandwidth insufficient – disconnect other USB devices.",
+            SGFPMError.ERROR_UNSUPPORTED_DEV   => "The device type specified is not supported.",
+            SGFPMError.ERROR_EXTRACT_FAIL      => "Template extraction failed.",
+            SGFPMError.ERROR_MATCH_FAIL        => "Template matching failed.",
+            _                                  => $"SDK error code {(int)error}.",
         };
 
         throw new SecuGenException($"{functionName} failed [{error}]: {detail}");
     }
+
+    /// <summary>Maps <see cref="SgDeviceType"/> to the managed SDK's <see cref="SGFPMDeviceName"/>.</summary>
+    private static SGFPMDeviceName MapDeviceType(SgDeviceType type) => type switch
+    {
+        SgDeviceType.Auto  => SGFPMDeviceName.DEV_AUTO,
+        SgDeviceType.FDP02 => SGFPMDeviceName.DEV_FDP02,
+        SgDeviceType.FDU02 => SGFPMDeviceName.DEV_FDU02,
+        SgDeviceType.FDU04 => SGFPMDeviceName.DEV_FDU04,
+        SgDeviceType.FDU03 => SGFPMDeviceName.DEV_FDU03,
+        SgDeviceType.FDU05 => SGFPMDeviceName.DEV_FDU05,
+        SgDeviceType.FDU07 => SGFPMDeviceName.DEV_FDU07,
+        SgDeviceType.FDU08 => SGFPMDeviceName.DEV_FDU08,
+        SgDeviceType.FDU09 => SGFPMDeviceName.DEV_FDU09,
+        _                  => SGFPMDeviceName.DEV_AUTO,
+    };
+
+    /// <summary>Maps <see cref="SGFPMDeviceName"/> back to the legacy <c>SgDeviceInfo.DevType</c> value.</summary>
+    private static uint MapDeviceNameToType(SGFPMDeviceName devName) => devName switch
+    {
+        SGFPMDeviceName.DEV_FDP02   => 0,   // Hamster II
+        SGFPMDeviceName.DEV_FDU02   => 2,   // Hamster IV
+        SGFPMDeviceName.DEV_FDU04   => 3,   // Hamster III
+        SGFPMDeviceName.DEV_FDU03   => 4,   // Hamster Plus
+        SGFPMDeviceName.DEV_FDU05   => 5,   // DEX
+        SGFPMDeviceName.DEV_FDU07   => 7,   // Hamster Pro 10
+        SGFPMDeviceName.DEV_FDU07A  => 7,   // Hamster Pro 10A
+        SGFPMDeviceName.DEV_FDU08   => 8,   // Hamster Pro 20
+        SGFPMDeviceName.DEV_FDU09   => 9,   // Hamster Pro 20 AP
+        SGFPMDeviceName.DEV_FDU10A  => 10,  // SDU03P
+        _                           => (uint)devName,
+    };
 }
 
 /// <summary>Exception thrown when a SecuGen SDK call fails.</summary>
